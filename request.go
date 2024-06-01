@@ -98,6 +98,7 @@ type infoQuery struct {
 	To        types.JID
 	Target    types.JID
 	ID        string
+	SmaxId	  string
 	Content   interface{}
 
 	Timeout time.Duration
@@ -114,6 +115,9 @@ func (cli *Client) sendIQAsyncAndGetData(query *infoQuery) (<-chan *waBinary.Nod
 		"id":    query.ID,
 		"xmlns": query.Namespace,
 		"type":  string(query.Type),
+	}
+	if len(query.SmaxId) > 0 {
+		attrs["smax_id"] = query.SmaxId
 	}
 	if !query.To.IsEmpty() {
 		attrs["to"] = query.To
