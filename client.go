@@ -20,13 +20,14 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"go.mau.fi/util/exhttp"
 	"go.mau.fi/util/random"
 	"golang.org/x/net/proxy"
 
 	"go.mau.fi/whatsmeow/appstate"
 	waBinary "go.mau.fi/whatsmeow/binary"
-	waProto "go.mau.fi/whatsmeow/binary/proto"
 	"go.mau.fi/whatsmeow/proto/waE2E"
+	"go.mau.fi/whatsmeow/proto/waWa6"
 	"go.mau.fi/whatsmeow/proto/waWeb"
 	"go.mau.fi/whatsmeow/socket"
 	"go.mau.fi/whatsmeow/store"
@@ -37,7 +38,7 @@ import (
 )
 
 // EventHandler is a function that can handle events from WhatsApp.
-type EventHandler func(evt interface{})
+type EventHandler func(evt any)
 type nodeHandler func(node *waBinary.Node)
 
 var nextHandlerID uint32
@@ -67,11 +68,16 @@ type Client struct {
 	isLoggedIn            atomic.Bool
 	expectedDisconnect    atomic.Bool
 	EnableAutoReconnect   bool
+	InitialAutoReconnect  bool
 	LastSuccessfulConnect time.Time
 	AutoReconnectErrors   int
 	// AutoReconnectHook is called when auto-reconnection fails. If the function returns false,
 	// the client will not attempt to reconnect. The number of retries can be read from AutoReconnectErrors.
 	AutoReconnectHook func(error) bool
+	// If SynchronousAck is set, acks for messages will only be sent after all event handlers return.
+	SynchronousAck             bool
+	EnableDecryptedEventBuffer bool
+	lastDecryptedBufferClear   time.Time
 
 	DisableLoginAutoReconnect bool
 
@@ -88,7 +94,7 @@ type Client struct {
 	appStateProc     *appstate.Processor
 	appStateSyncLock sync.Mutex
 
-	historySyncNotifications  chan *waProto.HistorySyncNotification
+	historySyncNotifications  chan *waE2E.HistorySyncNotification
 	historySyncHandlerStarted atomic.Bool
 
 	uploadPreKeysLock sync.Mutex
@@ -118,10 +124,10 @@ type Client struct {
 
 	privacySettingsCache atomic.Value
 
-	groupParticipantsCache     map[types.JID][]types.JID
-	groupParticipantsCacheLock sync.Mutex
-	userDevicesCache           map[types.JID]deviceCache
-	userDevicesCacheLock       sync.Mutex
+	groupCache           map[types.JID]*groupMetaCache
+	groupCacheLock       sync.Mutex
+	userDevicesCache     map[types.JID]deviceCache
+	userDevicesCacheLock sync.Mutex
 
 	recentMessagesMap  map[recentMessageKey]RecentMessage
 	recentMessagesList [recentMessagesSize]recentMessageKey
@@ -132,10 +138,10 @@ type Client struct {
 	sessionRecreateHistoryLock sync.Mutex
 	// GetMessageForRetry is used to find the source message for handling retry receipts
 	// when the message is not found in the recently sent message cache.
-	GetMessageForRetry func(requester, to types.JID, id types.MessageID) *waProto.Message
+	GetMessageForRetry func(requester, to types.JID, id types.MessageID) *waE2E.Message
 	// PreRetryCallback is called before a retry receipt is accepted.
 	// If it returns false, the accepting will be cancelled and the retry receipt will be ignored.
-	PreRetryCallback func(receipt *events.Receipt, id types.MessageID, retryCount int, msg *waProto.Message) bool
+	PreRetryCallback func(receipt *events.Receipt, id types.MessageID, retryCount int, msg *waE2E.Message) bool
 
 	// PrePairCallback is called before pairing is completed. If it returns false, the pairing will be cancelled and
 	// the client will disconnect.
@@ -143,7 +149,7 @@ type Client struct {
 
 	// GetClientPayload is called to get the client payload for connecting to the server.
 	// This should NOT be used for WhatsApp (to change the OS name, update fields in store.BaseClientPayload directly).
-	GetClientPayload func() *waProto.ClientPayload
+	GetClientPayload func() *waWa6.ClientPayload
 
 	// Should untrusted identity errors be handled automatically? If true, the stored identity and existing signal
 	// sessions will be removed on untrusted identity errors, and an events.IdentityChange will be dispatched.
@@ -170,6 +176,12 @@ type Client struct {
 	// The library is currently embedded in mautrix-meta (https://github.com/mautrix/meta), but may be separated later.
 	MessengerConfig *MessengerConfig
 	RefreshCAT      func() error
+}
+
+type groupMetaCache struct {
+	AddressingMode             types.AddressingMode
+	CommunityAnnouncementGroup bool
+	Members                    []types.JID
 }
 
 type MessengerConfig struct {
@@ -222,14 +234,14 @@ func NewClient(deviceStore *store.Device, log waLog.Logger) *Client {
 
 		incomingRetryRequestCounter: make(map[incomingRetryKey]int),
 
-		historySyncNotifications: make(chan *waProto.HistorySyncNotification, 32),
+		historySyncNotifications: make(chan *waE2E.HistorySyncNotification, 32),
 
-		groupParticipantsCache: make(map[types.JID][]types.JID),
-		userDevicesCache:       make(map[types.JID]deviceCache),
+		groupCache:       make(map[types.JID]*groupMetaCache),
+		userDevicesCache: make(map[types.JID]deviceCache),
 
 		recentMessagesMap:      make(map[recentMessageKey]RecentMessage, recentMessagesSize),
 		sessionRecreateHistory: make(map[types.JID]time.Time),
-		GetMessageForRetry:     func(requester, to types.JID, id types.MessageID) *waProto.Message { return nil },
+		GetMessageForRetry:     func(requester, to types.JID, id types.MessageID) *waE2E.Message { return nil },
 		appStateKeyRequests:    make(map[string]time.Time),
 
 		pendingPhoneRerequests: make(map[types.MessageID]context.CancelFunc),
@@ -376,11 +388,14 @@ func (cli *Client) getOwnID() types.JID {
 	if cli == nil {
 		return types.EmptyJID
 	}
-	id := cli.Store.ID
-	if id == nil {
+	return cli.Store.GetJID()
+}
+
+func (cli *Client) getOwnLID() types.JID {
+	if cli == nil {
 		return types.EmptyJID
 	}
-	return *id
+	return cli.Store.GetLID()
 }
 
 func (cli *Client) WaitForConnection(timeout time.Duration) bool {
@@ -410,6 +425,17 @@ func (cli *Client) SetWSDialer(dialer *websocket.Dialer) {
 // Connect connects the client to the WhatsApp web websocket. After connection, it will either
 // authenticate if there's data in the device store, or emit a QREvent to set up a new link.
 func (cli *Client) Connect() error {
+	err := cli.connect()
+	if exhttp.IsNetworkError(err) && cli.InitialAutoReconnect && cli.EnableAutoReconnect {
+		cli.Log.Errorf("Initial connection failed but reconnecting in background")
+		go cli.dispatchEvent(&events.Disconnected{})
+		go cli.autoReconnect()
+		return nil
+	}
+	return err
+}
+
+func (cli *Client) connect() error {
 	if cli == nil {
 		return ErrClientIsNil
 	}
@@ -508,7 +534,7 @@ func (cli *Client) autoReconnect() {
 		cli.Log.Debugf("Automatically reconnecting after %v", autoReconnectDelay)
 		cli.AutoReconnectErrors++
 		time.Sleep(autoReconnectDelay)
-		err := cli.Connect()
+		err := cli.connect()
 		if errors.Is(err, ErrAlreadyConnected) {
 			cli.Log.Debugf("Connect() said we're already connected after autoreconnect sleep")
 			return
@@ -547,6 +573,7 @@ func (cli *Client) Disconnect() {
 	cli.socketLock.Lock()
 	cli.unlockedDisconnect()
 	cli.socketLock.Unlock()
+	cli.clearDelayedMessageRequests()
 }
 
 // Disconnect closes the websocket connection.
@@ -565,7 +592,7 @@ func (cli *Client) unlockedDisconnect() {
 //
 // Note that this will not emit any events. The LoggedOut event is only used for external logouts
 // (triggered by the user from the main device or by WhatsApp servers).
-func (cli *Client) Logout() error {
+func (cli *Client) Logout(ctx context.Context) error {
 	if cli == nil {
 		return ErrClientIsNil
 	} else if cli.MessengerConfig != nil {
@@ -591,7 +618,7 @@ func (cli *Client) Logout() error {
 		return fmt.Errorf("error sending logout request: %w", err)
 	}
 	cli.Disconnect()
-	err = cli.Store.Delete()
+	err = cli.Store.Delete(ctx)
 	if err != nil {
 		return fmt.Errorf("error deleting data from store: %w", err)
 	}
@@ -776,7 +803,7 @@ func (cli *Client) sendNode(node waBinary.Node) error {
 	return err
 }
 
-func (cli *Client) dispatchEvent(evt interface{}) {
+func (cli *Client) dispatchEvent(evt any) {
 	cli.eventHandlersLock.RLock()
 	defer func() {
 		cli.eventHandlersLock.RUnlock()
@@ -822,7 +849,7 @@ func (cli *Client) ParseWebMessage(chatJID types.JID, webMsg *waWeb.WebMessageIn
 		if info.Sender.IsEmpty() {
 			return nil, ErrNotLoggedIn
 		}
-	} else if chatJID.Server == types.DefaultUserServer || chatJID.Server == types.NewsletterServer {
+	} else if chatJID.Server == types.DefaultUserServer || chatJID.Server == types.HiddenUserServer || chatJID.Server == types.NewsletterServer {
 		info.Sender = chatJID
 	} else if webMsg.GetParticipant() != "" {
 		info.Sender, err = types.ParseJID(webMsg.GetParticipant())
@@ -833,6 +860,10 @@ func (cli *Client) ParseWebMessage(chatJID types.JID, webMsg *waWeb.WebMessageIn
 	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse sender of message %s: %v", info.ID, err)
+	}
+	if pk := webMsg.GetCommentMetadata().GetCommentParentKey(); pk != nil {
+		info.MsgMetaInfo.ThreadMessageID = pk.GetID()
+		info.MsgMetaInfo.ThreadMessageSenderJID, _ = types.ParseJID(pk.GetParticipant())
 	}
 	evt := &events.Message{
 		RawMessage:   webMsg.GetMessage(),
@@ -845,4 +876,21 @@ func (cli *Client) ParseWebMessage(chatJID types.JID, webMsg *waWeb.WebMessageIn
 		evt.Message = evt.Message.GetProtocolMessage().GetEditedMessage()
 	}
 	return evt, nil
+}
+
+func (cli *Client) StoreLIDPNMapping(ctx context.Context, first, second types.JID) {
+	var lid, pn types.JID
+	if first.Server == types.HiddenUserServer && second.Server == types.DefaultUserServer {
+		lid = first
+		pn = second
+	} else if first.Server == types.DefaultUserServer && second.Server == types.HiddenUserServer {
+		lid = second
+		pn = first
+	} else {
+		return
+	}
+	err := cli.Store.LIDs.PutLIDMapping(ctx, lid, pn)
+	if err != nil {
+		cli.Log.Errorf("Failed to store LID-PN mapping for %s -> %s: %v", lid, pn, err)
+	}
 }
